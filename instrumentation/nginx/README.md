@@ -17,6 +17,7 @@ Supported propagation types:
 
 Additional platforms and/or versions coming soon.
 
+
 ## Dependencies (for building)
 
 1. [gRPC](https://github.com/grpc/grpc) - currently the only supported exporter is OTLP. This requirement will be lifted
@@ -38,7 +39,7 @@ make
 
 ## Usage
 
-Modify nginx.conf, or see the [example](test/conf/nginx.conf)
+Download the .so file from the latest [GitHub Action run](https://github.com/open-telemetry/opentelemetry-cpp-contrib/actions/workflows/nginx.yml) or follow the instructions above to build. Then modify nginx.conf, or see the [example](test/conf/nginx.conf)
 
 ```
 load_module /path/to/otel_ngx_module.so;
@@ -117,6 +118,14 @@ Enable or disable OpenTelemetry (default: enabled).
 - **syntax**: `opentelemetry on|off`
 - **block**: `http`, `server`, `location`
 
+### `opentelemetry_trust_incoming_spans`
+
+Enables or disables using spans from incoming requests as parent for created ones. (default: enabled).
+
+- **required**: `false`
+- **syntax**: `opentelemetry_trust_incoming_spans on|off`
+- **block**: `http`, `server`, `location`
+
 ### `opentelemetry_attribute`
 
 Adds a custom attribute to the span. It is possible to access nginx variables, e.g.
@@ -151,6 +160,30 @@ be started. The default propagator is W3C.
 - **syntax**: `opentelemetry_propagate` or `opentelemetry_propagate b3`
 - **block**: `http`, `server`, `location`
 
+### `opentelemetry_capture_headers`
+
+Enables the capturing of request and response headers. (default: disabled).
+
+- **required**: `false`
+- **syntax**: `opentelemetry_capture_headers on|off`
+- **block**: `http`, `server`, `location`
+
+### `opentelemetry_sensitive_header_names`
+
+Sets the captured header value to `[REDACTED]` for all headers where the name matches the given regex (case insensitive).
+
+- **required**: `false`
+- **syntax**: `opentelemetry_sensitive_header_names <regex>`
+- **block**: `http`, `server`, `location`
+
+### `opentelemetry_sensitive_header_values`
+
+Sets the captured header value to `[REDACTED]` for all headers where the value matches the given regex (case insensitive).
+
+- **required**: `false`
+- **syntax**: `opentelemetry_sensitive_header_values <regex>`
+- **block**: `http`, `server`, `location`
+
 ## OpenTelemetry attributes
 
 List of exported attributes and their corresponding nginx variables if applicable:
@@ -162,6 +195,29 @@ List of exported attributes and their corresponding nginx variables if applicabl
 - `http.host` - `Host` header value
 - `http.scheme` - `$scheme`
 - `http.server_name` - From the `server_name` directive
+- `http.user_agent` - `User-Agent` header value
+- `http.request.header.*` - The request headers (except `Host` and `User-Agent`)
+- `http.response.header.*` - The response headers
+- `net.host.port` - `$server_port`
+- `net.peer.ip` - `$remote_addr`
+- `net.peer.port` - `$remote_port`
+
+## nginx variables
+
+The following nginx variables are set by the instrumentation:
+
+- `opentelemetry_context_traceparent` - [W3C trace
+  context](https://www.w3.org/TR/trace-context/#trace-context-http-headers-format), e.g.: `00-0af7651916cd43dd8448eb211c80319c-b9c7c989f97918e1-01`
+- `opentelemetry_context_b3` - Trace context in the [B3
+  format](https://github.com/openzipkin/b3-propagation#single-header). Only set when using `opentelemetry_propagate b3`.
+- `opentelemetry_trace_id` - Trace Id of the current span
+- `opentelemetry_span_id` - Span Id of the current span
+
+This can be used to add `Server-Timing` header:
+
+```
+add_header Server-Timing "traceparent;desc=\"$opentelemetry_context_traceparent\"";
+```
 
 ## Testing
 

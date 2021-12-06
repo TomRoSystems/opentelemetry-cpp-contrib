@@ -85,11 +85,27 @@ defmodule InstrumentationTest do
     [il_spans] = resource_spans["instrumentationLibrarySpans"]
     il_spans["spans"]
   end
+  
+  def values(map) do
+    Enum.map(map, fn {k, v} ->
+      case k do
+        "intValue" ->
+          String.to_integer(v)
+
+        "arrayValue" ->
+          [t] = Enum.map(v["values"], fn v -> values(v) end)
+          t
+
+        _ ->
+          v
+      end
+    end)
+  end
 
   def attrib(span, key) do
     case Enum.find(span["attributes"], fn %{"key" => k} -> k == key end) do
       %{"value" => val} ->
-        [v] = Map.values(val)
+        [v] = values(val)
         v
 
       _ ->
@@ -146,12 +162,16 @@ defmodule InstrumentationTest do
   end
 
   test "HTTP upstream | span attributes", %{trace_file: trace_file} do
-    %HTTPoison.Response{status_code: status} = HTTPoison.get!("#{@host}/?foo=bar&x=42")
+    %HTTPoison.Response{status_code: status} = HTTPoison.get!("#{@host}/?foo=bar&x=42", [{"User-Agent", "otel-test"}, {"My-Header", "My-Value"}])
 
     [trace] = read_traces(trace_file, 1)
     [span] = collect_spans(trace)
 
     assert status == 200
+
+    assert attrib(span, "net.host.port") == 8000
+    assert attrib(span, "net.peer.ip") =~ ~r/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/
+    assert attrib(span, "net.peer.port") > 0
 
     assert attrib(span, "http.method") == "GET"
     assert attrib(span, "http.flavor") == "1.1"
@@ -159,10 +179,66 @@ defmodule InstrumentationTest do
     assert attrib(span, "http.host") == @host
     assert attrib(span, "http.server_name") == "otel_test"
     assert attrib(span, "http.scheme") == "http"
-    assert attrib(span, "http.status_code") == "200"
+    assert attrib(span, "http.status_code") == 200
+    assert attrib(span, "http.user_agent") == "otel-test"
+    assert attrib(span, "http.request.header.host") == nil
+    assert attrib(span, "http.request.header.user_agent") == nil
+    assert attrib(span, "http.request.header.my_header") == nil
 
     assert span["kind"] == "SPAN_KIND_SERVER"
     assert span["name"] == "simple_backend"
+  end
+
+  test "location with opentelemetry_capture_headers on should capture headers", %{trace_file: trace_file} do
+    %HTTPoison.Response{status_code: status} = HTTPoison.get!("#{@host}/capture_headers", [{"Request-Header", "Request-Value"}])
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+
+    assert status == 200
+
+    assert attrib(span, "http.request.header.host") == nil
+    assert attrib(span, "http.request.header.user_agent") == nil
+    assert attrib(span, "http.request.header.request_header") == ["Request-Value"]
+    assert attrib(span, "http.response.header.response_header") == ["Response-Value"]
+  end
+
+  test "location with opentelemetry_capture_headers and sensitive header name should redact header value", %{trace_file: trace_file} do
+    %HTTPoison.Response{status_code: status} = HTTPoison.get!("#{@host}/capture_headers_with_sensitive_header_name", [{"Request-Header", "Foo"}])
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+
+    assert status == 200
+
+    assert attrib(span, "http.request.header.host") == nil
+    assert attrib(span, "http.request.header.user_agent") == nil
+    assert attrib(span, "http.request.header.request_header") == ["[REDACTED]"]
+    assert attrib(span, "http.response.header.response_header") == ["[REDACTED]"]
+  end
+
+  test "location with opentelemetry_capture_headers and sensitive header value should redact header value", %{trace_file: trace_file} do
+    %HTTPoison.Response{status_code: status} = HTTPoison.get!("#{@host}/capture_headers_with_sensitive_header_value", [{"Bar", "Request-Value"}])
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+
+    assert status == 200
+
+    assert attrib(span, "http.request.header.host") == nil
+    assert attrib(span, "http.request.header.user_agent") == nil
+    assert attrib(span, "http.request.header.bar") == ["[REDACTED]"]
+    assert attrib(span, "http.response.header.bar") == ["[REDACTED]"]
+  end
+
+   test "location without operation name should use operation name from server", %{trace_file: trace_file} do
+    %HTTPoison.Response{status_code: status} = HTTPoison.get!("#{@host}/no_operation_name")
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+
+    assert status == 200
+    assert span["name"] == "otel_test"
   end
 
   def test_parent_span(url, %{trace_file: trace_file}) do
@@ -197,7 +273,7 @@ defmodule InstrumentationTest do
 
     assert status == 200
     assert span["parentSpanId"] == ""
-    assert attrib(span, "http.status_code") == "200"
+    assert attrib(span, "http.status_code") == 200
   end
 
   test "HTTP upstream | span is associated with parent", ctx do
@@ -217,7 +293,7 @@ defmodule InstrumentationTest do
     assert attrib(span, "http.host") == @host
     assert attrib(span, "http.server_name") == "otel_test"
     assert attrib(span, "http.scheme") == "http"
-    assert attrib(span, "http.status_code") == "200"
+    assert attrib(span, "http.status_code") == 200
 
     assert span["parentSpanId"] == ""
     assert span["kind"] == "SPAN_KIND_SERVER"
@@ -313,7 +389,7 @@ defmodule InstrumentationTest do
     assert attrib(span, "http.host") == @host
     assert attrib(span, "http.server_name") == "otel_test"
     assert attrib(span, "http.scheme") == "http"
-    assert attrib(span, "http.status_code") == "200"
+    assert attrib(span, "http.status_code") == 200
 
     assert span["parentSpanId"] == ""
     assert span["kind"] == "SPAN_KIND_SERVER"
@@ -332,6 +408,24 @@ defmodule InstrumentationTest do
     assert status == 200
   end
 
+  test "Accessing a route with disabled trustIncomingsSpans is not associated with a parent", %{
+    trace_file: trace_file
+  } do
+    input_trace_id = "aad85b4f655feed4d594a01cfa6a1d62"
+
+    %HTTPoison.Response{status_code: status} =
+      HTTPoison.get!("#{@host}/distrust_incoming_spans", [
+        {"traceparent", "00-#{input_trace_id}-2a9d49c3e3b7c461-00"}
+      ])
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+
+    assert status == 200
+    assert span["traceId"] != input_trace_id
+    assert span["parentSpanId"] == ""
+  end
+
   test "Spans with custom attributes are produced", %{
     trace_file: trace_file
   } do
@@ -341,6 +435,48 @@ defmodule InstrumentationTest do
     assert attrib(span, "test.attrib.custom") == "local"
     assert attrib(span, "test.attrib.global") == "global"
     assert attrib(span, "test.attrib.script") =~ ~r/\d+\.\d+/
+    assert status == 200
+  end
+
+  test "Accessing trace context", %{
+    trace_file: trace_file
+  } do
+    %HTTPoison.Response{status_code: status, headers: headers} =
+      HTTPoison.get!("#{@host}/context")
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+    {_, header_context} = Enum.find(headers, fn {k, _} -> k == "Context-TraceParent" end)
+    trace_id = span["traceId"]
+    span_id = span["spanId"]
+    context = "00-#{trace_id}-#{span_id}-01"
+    assert header_context == context
+    assert status == 200
+  end
+
+  test "Accessing trace id", %{
+    trace_file: trace_file
+  } do
+    %HTTPoison.Response{status_code: status, headers: headers} =
+      HTTPoison.get!("#{@host}/trace_id")
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+    {_, header_trace_id} = Enum.find(headers, fn {k, _} -> k == "Trace-Id" end)
+    assert header_trace_id == span["traceId"]
+    assert status == 200
+  end
+
+  test "Accessing span id", %{
+    trace_file: trace_file
+  } do
+    %HTTPoison.Response{status_code: status, headers: headers} =
+      HTTPoison.get!("#{@host}/span_id")
+
+    [trace] = read_traces(trace_file, 1)
+    [span] = collect_spans(trace)
+    {_, header_span_id} = Enum.find(headers, fn {k, _} -> k == "Span-Id" end)
+    assert header_span_id == span["spanId"]
     assert status == 200
   end
 end

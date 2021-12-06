@@ -1,5 +1,6 @@
 #include <opentelemetry/sdk/trace/processor.h>
 #include <opentelemetry/trace/span.h>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -21,12 +22,12 @@ extern ngx_module_t otel_ngx_module;
 #include <opentelemetry/nostd/shared_ptr.h>
 #include <opentelemetry/sdk/trace/batch_span_processor.h>
 #include <opentelemetry/sdk/trace/id_generator.h>
-#include <opentelemetry/sdk/trace/simple_processor.h>
-#include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/sdk/trace/samplers/always_off.h>
 #include <opentelemetry/sdk/trace/samplers/always_on.h>
 #include <opentelemetry/sdk/trace/samplers/parent.h>
 #include <opentelemetry/sdk/trace/samplers/trace_id_ratio.h>
+#include <opentelemetry/sdk/trace/simple_processor.h>
+#include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/trace/provider.h>
 
 namespace trace = opentelemetry::trace;
@@ -34,10 +35,13 @@ namespace nostd = opentelemetry::nostd;
 namespace sdktrace = opentelemetry::sdk::trace;
 namespace otlp = opentelemetry::exporter::otlp;
 
-constexpr char kOtelCtxVarPrefix[] = "otel_ctxvar_";
+constexpr char kOtelCtxVarPrefix[] = "opentelemetry_context_";
 
 const ScriptAttributeDeclaration kDefaultScriptAttributes[] = {
   {"http.scheme", "$scheme"},
+  {"net.host.port", "$server_port", ScriptAttributeInt},
+  {"net.peer.ip", "$remote_addr"},
+  {"net.peer.port", "$remote_port", ScriptAttributeInt},
 };
 
 struct OtelMainConf {
@@ -62,6 +66,60 @@ nostd::string_view NgxHttpFlavor(ngx_http_request_t* req) {
   }
 }
 
+static void NgxNormalizeAndCopyString(u_char* dst, ngx_str_t str) {
+  for (ngx_uint_t i = 0; i < str.len; ++i) {
+    u_char ch = str.data[i];
+    if (ch >= 'A' && ch <= 'Z') {
+      ch += 0x20;
+    } else if (ch == '-') {
+      ch = '_';
+    }
+
+    dst[i] = ch;
+  }
+}
+
+static void OtelCaptureHeaders(nostd::shared_ptr<opentelemetry::trace::Span> span, ngx_str_t keyPrefix, ngx_list_t *headers,
+                        ngx_regex_t *sensitiveHeaderNames, ngx_regex_t *sensitiveHeaderValues,
+                        nostd::span<ngx_table_elt_t*> excludedHeaders = {}) {
+  for (ngx_list_part_t *part = &headers->part; part != nullptr; part = part->next) {
+    ngx_table_elt_t *header = (ngx_table_elt_t*) part->elts;
+    for (ngx_uint_t i = 0; i < part->nelts; ++i) {
+      if (std::find(excludedHeaders.begin(), excludedHeaders.end(), &header[i]) != excludedHeaders.end()) {
+        continue;
+      }
+
+      u_char key[keyPrefix.len + header[i].key.len]; 
+      NgxNormalizeAndCopyString((u_char*)ngx_copy(key, keyPrefix.data, keyPrefix.len), header[i].key);
+
+      bool sensitiveHeader = false;
+#if (NGX_PCRE)
+      if (sensitiveHeaderNames) {
+        int ovector[3];
+        if (ngx_regex_exec(sensitiveHeaderNames, &header[i].key, ovector, 0) >= 0) {
+          sensitiveHeader = true;
+        }
+      }
+      if (sensitiveHeaderValues && !sensitiveHeader) {
+        int ovector[3];
+        if (ngx_regex_exec(sensitiveHeaderValues, &header[i].value, ovector, 0) >= 0) {
+          sensitiveHeader = true;
+        }
+      }
+#endif
+
+      nostd::string_view value;
+      if (sensitiveHeader) {
+        value = "[REDACTED]";
+      } else {
+        value = FromNgxString(header[i].value);
+      }
+
+      span->SetAttribute({(const char*)key, keyPrefix.len + header[i].key.len}, nostd::span<const nostd::string_view>(&value, 1));
+    }
+  }
+}
+
 static ngx_int_t OtelGetContextVar(ngx_http_request_t*, ngx_http_variable_value_t*, uintptr_t) {
   // Filled out on context creation.
   return NGX_OK;
@@ -69,6 +127,12 @@ static ngx_int_t OtelGetContextVar(ngx_http_request_t*, ngx_http_variable_value_
 
 static ngx_int_t
 OtelGetTraceContextVar(ngx_http_request_t* req, ngx_http_variable_value_t* v, uintptr_t data);
+
+static ngx_int_t
+OtelGetTraceId(ngx_http_request_t* req, ngx_http_variable_value_t* v, uintptr_t data);
+
+static ngx_int_t
+OtelGetSpanId(ngx_http_request_t* req, ngx_http_variable_value_t* v, uintptr_t data);
 
 static ngx_http_variable_t otel_ngx_variables[] = {
   {
@@ -85,6 +149,22 @@ static ngx_http_variable_t otel_ngx_variables[] = {
     OtelGetTraceContextVar,
     0,
     NGX_HTTP_VAR_PREFIX | NGX_HTTP_VAR_NOHASH | NGX_HTTP_VAR_NOCACHEABLE,
+    0,
+  },
+  {
+    ngx_string("opentelemetry_trace_id"),
+    nullptr,
+    OtelGetTraceId,
+    0,
+    NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
+    0,
+  },
+  {
+    ngx_string("opentelemetry_span_id"),
+    nullptr,
+    OtelGetSpanId,
+    0,
+    NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
     0,
   },
   ngx_http_null_variable,
@@ -139,6 +219,104 @@ OtelGetTraceContextVar(ngx_http_request_t* req, ngx_http_variable_value_t* v, ui
     v->valid = 0;
     v->not_found = 1;
     v->no_cacheable = 1;
+    v->data = nullptr;
+  }
+
+  return NGX_OK;
+}
+
+static ngx_int_t
+OtelGetTraceId(ngx_http_request_t* req, ngx_http_variable_value_t* v, uintptr_t data) {
+  TraceContext* traceContext = GetTraceContext(req);
+
+  if (traceContext == nullptr || !traceContext->request_span) {
+    ngx_log_error(
+      NGX_LOG_ERR, req->connection->log, 0,
+      "Unable to get trace context when getting trace id");
+    return NGX_OK;
+  }
+
+  trace::SpanContext spanContext = traceContext->request_span->GetContext();
+
+  if (spanContext.IsValid()) {
+    constexpr int len = 2 * trace::TraceId::kSize;
+    char* data = (char*)ngx_palloc(req->pool, len);
+
+    if(!data) {
+      ngx_log_error(
+        NGX_LOG_ERR, req->connection->log, 0,
+        "Unable to allocate memory for the trace id");
+
+      v->len = 0;
+      v->valid = 0;
+      v->no_cacheable = 1;
+      v->not_found = 0;
+      v->data = nullptr;
+
+      return NGX_OK;
+    }
+
+    spanContext.trace_id().ToLowerBase16(nostd::span<char, len>{data, len});
+
+    v->len = len;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+    v->data = (u_char*)data;
+  } else {
+    v->len = 0;
+    v->valid = 0;
+    v->no_cacheable = 1;
+    v->not_found = 1;
+    v->data = nullptr;
+  }
+
+  return NGX_OK;
+}
+
+static ngx_int_t
+OtelGetSpanId(ngx_http_request_t* req, ngx_http_variable_value_t* v, uintptr_t data) {
+  TraceContext* traceContext = GetTraceContext(req);
+
+  if (traceContext == nullptr || !traceContext->request_span) {
+    ngx_log_error(
+      NGX_LOG_ERR, req->connection->log, 0,
+      "Unable to get trace context when getting span id");
+    return NGX_OK;
+  }
+
+  trace::SpanContext spanContext = traceContext->request_span->GetContext();
+
+  if (spanContext.IsValid()) {
+    constexpr int len = 2 * trace::SpanId::kSize;
+    char* data = (char*)ngx_palloc(req->pool, len);
+
+    if(!data) {
+      ngx_log_error(
+        NGX_LOG_ERR, req->connection->log, 0,
+        "Unable to allocate memory for the span id");
+
+      v->len = 0;
+      v->valid = 0;
+      v->no_cacheable = 1;
+      v->not_found = 0;
+      v->data = nullptr;
+
+      return NGX_OK;
+    }
+
+    spanContext.span_id().ToLowerBase16(nostd::span<char, len>{data, len});
+
+    v->len = len;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+    v->data = (u_char*)data;
+  } else {
+    v->len = 0;
+    v->valid = 0;
+    v->no_cacheable = 1;
+    v->not_found = 1;
     v->data = nullptr;
   }
 
@@ -208,7 +386,13 @@ ngx_int_t StartNgxSpan(ngx_http_request_t* req) {
   val->len = sizeof(TraceContext);
 
   OtelCarrier carrier{req, context};
-  auto incomingContext = ExtractContext(&carrier);
+  opentelemetry::context::Context incomingContext;
+
+  OtelNgxLocationConf* locConf = GetOtelLocationConf(req);
+
+  if (locConf->trustIncomingSpans) {
+    incomingContext = ExtractContext(&carrier);
+  }
 
   trace::StartSpanOptions startOpts;
   startOpts.kind = trace::SpanKind::kServer;
@@ -227,6 +411,17 @@ ngx_int_t StartNgxSpan(ngx_http_request_t* req) {
   nostd::string_view serverName = GetNgxServerName(req);
   if (!serverName.empty()) {
     context->request_span->SetAttribute("http.server_name", serverName);
+  }
+
+  if (req->headers_in.user_agent) {
+    context->request_span->SetAttribute("http.user_agent", FromNgxString(req->headers_in.user_agent->value));
+  }
+
+  if (locConf->captureHeaders) {
+    ngx_table_elt_t* excludedHeaders[] = {req->headers_in.host, req->headers_in.user_agent};
+    OtelCaptureHeaders(context->request_span, ngx_string("http.request.header."), &req->headers_in.headers,
+                       locConf->sensitiveHeaderNames, locConf->sensitiveHeaderValues,
+                       {excludedHeaders, 2});
   }
 
   auto outgoingContext = incomingContext.SetValue(trace::kSpanKey, context->request_span);
@@ -250,7 +445,13 @@ void AddScriptAttributes(
     ngx_str_t value = ngx_null_string;
 
     if (attribute->key.Run(req, &key) && attribute->value.Run(req, &value)) {
-      span->SetAttribute(FromNgxString(key), FromNgxString(value));
+      switch(attribute->type) {
+        case ScriptAttributeInt:
+          span->SetAttribute(FromNgxString(key), ngx_atoi(value.data, value.len));
+          break;
+        default:
+          span->SetAttribute(FromNgxString(key), FromNgxString(value));
+      }
     }
   }
 }
@@ -269,8 +470,15 @@ ngx_int_t FinishNgxSpan(ngx_http_request_t* req) {
   auto span = context->request_span;
   span->SetAttribute("http.status_code", req->headers_out.status);
 
+  OtelNgxLocationConf* locConf = GetOtelLocationConf(req);
+
+  if (locConf->captureHeaders) {
+    OtelCaptureHeaders(span, ngx_string("http.response.header."), &req->headers_out.headers,
+                       locConf->sensitiveHeaderNames, locConf->sensitiveHeaderValues);
+  }
+
   AddScriptAttributes(span.get(), GetOtelMainConf(req)->scriptAttributes, req);
-  AddScriptAttributes(span.get(), GetOtelLocationConf(req)->customAttributes, req);
+  AddScriptAttributes(span.get(), locConf->customAttributes, req);
 
   span->UpdateName(GetOperationName(req));
 
@@ -355,6 +563,19 @@ static char* MergeLocConf(ngx_conf_t*, void* parent, void* child) {
   OtelNgxLocationConf* conf = (OtelNgxLocationConf*)child;
 
   ngx_conf_merge_value(conf->enabled, prev->enabled, 1);
+
+  ngx_conf_merge_value(conf->trustIncomingSpans, prev->trustIncomingSpans, 1);
+
+  ngx_conf_merge_value(conf->captureHeaders, prev->captureHeaders, 0);
+
+#if (NGX_PCRE)
+  ngx_conf_merge_ptr_value(conf->sensitiveHeaderNames, prev->sensitiveHeaderNames, nullptr);
+  ngx_conf_merge_ptr_value(conf->sensitiveHeaderValues, prev->sensitiveHeaderValues, nullptr);
+#endif
+
+  if (!prev->operationNameScript.IsEmpty() && conf->operationNameScript.IsEmpty()) {
+    conf->operationNameScript = prev->operationNameScript;
+  }
 
   if (prev->customAttributes && !conf->customAttributes) {
     conf->customAttributes = prev->customAttributes;
@@ -449,17 +670,17 @@ struct HeaderPropagation {
 
 std::vector<HeaderPropagation> B3PropagationVars() {
   return {
-    {"proxy_set_header", "b3", "$otel_ctxvar_b3"},
-    {"fastcgi_param", "HTTP_B3", "$otel_ctxvar_b3"},
+    {"proxy_set_header", "b3", "$opentelemetry_context_b3"},
+    {"fastcgi_param", "HTTP_B3", "$opentelemetry_context_b3"},
   };
 }
 
 std::vector<HeaderPropagation> OtelPropagationVars() {
   return {
-    {"proxy_set_header", "traceparent", "$otel_ctxvar_traceparent"},
-    {"proxy_set_header", "tracestate", "$otel_ctxvar_tracestate"},
-    {"fastcgi_param", "HTTP_TRACEPARENT", "$otel_ctxvar_traceparent"},
-    {"fastcgi_param", "HTTP_TRACESTATE", "$otel_ctxvar_tracestate"},
+    {"proxy_set_header", "traceparent", "$opentelemetry_context_traceparent"},
+    {"proxy_set_header", "tracestate", "$opentelemetry_context_tracestate"},
+    {"fastcgi_param", "HTTP_TRACEPARENT", "$opentelemetry_context_traceparent"},
+    {"fastcgi_param", "HTTP_TRACESTATE", "$opentelemetry_context_tracestate"},
   };
 }
 
@@ -558,6 +779,52 @@ static char* OtelNgxSetCustomAttribute(ngx_conf_t* conf, ngx_command_t*, void* u
   return NGX_CONF_OK;
 }
 
+#if (NGX_PCRE)
+static ngx_regex_t* NgxCompileRegex(ngx_conf_t* conf, ngx_str_t pattern) {
+  u_char err[NGX_MAX_CONF_ERRSTR];
+
+  ngx_regex_compile_t rc;
+  ngx_memzero(&rc, sizeof(ngx_regex_compile_t));
+
+  rc.pool = conf->pool;
+  rc.pattern = pattern;
+  rc.options = NGX_REGEX_CASELESS;
+  rc.err.data = err;
+  rc.err.len = sizeof(err);
+
+  if (ngx_regex_compile(&rc) != NGX_OK) {
+    ngx_log_error(NGX_LOG_ERR, conf->log, 0, "illegal regex in %V: %V", (ngx_str_t*)conf->args->elts, &rc.err);
+    return nullptr;
+  }
+
+  return rc.regex;
+}
+
+static char* OtelNgxSetSensitiveHeaderNames(ngx_conf_t* conf, ngx_command_t*, void* userConf) {
+  OtelNgxLocationConf* locConf = (OtelNgxLocationConf*)userConf;
+  ngx_str_t* args = (ngx_str_t*)conf->args->elts;
+
+  locConf->sensitiveHeaderNames = NgxCompileRegex(conf, args[1]);
+  if (!locConf->sensitiveHeaderNames) {
+    return (char*)NGX_CONF_ERROR;
+  }
+
+  return NGX_CONF_OK;
+}
+
+static char* OtelNgxSetSensitiveHeaderValues(ngx_conf_t* conf, ngx_command_t*, void* userConf) {
+  OtelNgxLocationConf* locConf = (OtelNgxLocationConf*)userConf;
+  ngx_str_t* args = (ngx_str_t*)conf->args->elts;
+
+  locConf->sensitiveHeaderValues = NgxCompileRegex(conf, args[1]);
+  if (!locConf->sensitiveHeaderValues) {
+    return (char*)NGX_CONF_ERROR;
+  }
+
+  return NGX_CONF_OK;
+}
+#endif
+
 static ngx_command_t kOtelNgxCommands[] = {
   {
     ngx_string("opentelemetry_propagate"),
@@ -599,6 +866,40 @@ static ngx_command_t kOtelNgxCommands[] = {
     offsetof(OtelNgxLocationConf, enabled),
     nullptr,
   },
+  {
+    ngx_string("opentelemetry_trust_incoming_spans"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_conf_set_flag_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(OtelNgxLocationConf, trustIncomingSpans),
+    nullptr,
+  },
+  {
+    ngx_string("opentelemetry_capture_headers"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_conf_set_flag_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(OtelNgxLocationConf, captureHeaders),
+    nullptr,
+  },
+#if (NGX_PCRE)
+  {
+    ngx_string("opentelemetry_sensitive_header_names"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    OtelNgxSetSensitiveHeaderNames,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    0,
+    nullptr,
+  },
+  {
+    ngx_string("opentelemetry_sensitive_header_values"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    OtelNgxSetSensitiveHeaderValues,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    0,
+    nullptr,
+  },
+#endif
   ngx_null_command,
 };
 
@@ -638,8 +939,7 @@ CreateProcessor(const OtelNgxAgentConfig* conf, std::unique_ptr<sdktrace::SpanEx
     new sdktrace::SimpleSpanProcessor(std::move(exporter)));
 }
 
-static std::unique_ptr<sdktrace::Sampler>
-CreateSampler(const OtelNgxAgentConfig* conf) {
+static std::unique_ptr<sdktrace::Sampler> CreateSampler(const OtelNgxAgentConfig* conf) {
   if (conf->sampler.parentBased) {
     std::shared_ptr<sdktrace::Sampler> sampler;
 
@@ -705,10 +1005,11 @@ static ngx_int_t OtelNgxStart(ngx_cycle_t* cycle) {
   }
 
   auto processor = CreateProcessor(agentConf, std::move(exporter));
-  auto provider = nostd::shared_ptr<opentelemetry::trace::TracerProvider>(new sdktrace::TracerProvider(
-    std::move(processor),
-    opentelemetry::sdk::resource::Resource::Create({{"service.name", agentConf->service.name}}),
-    std::move(sampler)));
+  auto provider =
+    nostd::shared_ptr<opentelemetry::trace::TracerProvider>(new sdktrace::TracerProvider(
+      std::move(processor),
+      opentelemetry::sdk::resource::Resource::Create({{"service.name", agentConf->service.name}}),
+      std::move(sampler)));
 
   opentelemetry::trace::Provider::SetTracerProvider(std::move(provider));
 
