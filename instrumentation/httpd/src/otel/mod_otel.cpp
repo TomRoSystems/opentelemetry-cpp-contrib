@@ -148,6 +148,10 @@ static int opentel_handler(request_rec *r, int /* lookup_uri */ )
   req_data->span  = span;
   req_data->StartSpan(GetAttrsFromRequest(req));
 
+  // expose traceparent and tracestate to environment variables
+  HttpdCarrier env(*req->subprocess_env);
+  PropagatorTraceContext.Inject(env, opentelemetry::context::RuntimeContext::GetCurrent());
+
   return DECLINED;
 }
 
