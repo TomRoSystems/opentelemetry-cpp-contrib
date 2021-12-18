@@ -26,7 +26,6 @@
 #include "http_config.h"
 #include "http_protocol.h"
 #include "mod_proxy.h"
-
 namespace
 {
 
@@ -37,6 +36,10 @@ using namespace httpd_otel;
 const char kOpenTelemetryKeyNote[] = "OTEL";
 const char kOpenTelemetryKeyOutboundNote[] = "OTEL_PROXY";
 
+const char kEnvVarSpanId[] = "OTEL_SPANID";
+const char kEnvVarTraceId[] = "OTEL_TRACEID";
+const char kEnvVarTraceFlags[] = "OTEL_TRACEFLAGS";
+const char kEnvVarTraceState[] = "OTEL_TRACESTATE";
 class HttpdCarrier : public opentelemetry::context::propagation::TextMapCarrier
 {
 public:
@@ -99,6 +102,28 @@ static void opentel_child_created(apr_pool_t*, server_rec*)
   initTracer();
 }
 
+// populates environment variables which can be used by other parts of httpd
+void addEnvVars(apr_table_t *envTable, opentelemetry::trace::SpanContext ctx)
+{
+  union {
+    char bfr[40] = {0};
+    char flags[1];
+    char spanId[16];
+    char traceId[32];
+  } ;
+
+  if (ctx.trace_flags().IsSampled())
+  {
+    apr_table_set(envTable, kEnvVarTraceFlags, "1");
+  }
+
+  ctx.span_id().ToLowerBase16(spanId);
+  apr_table_set(envTable, kEnvVarSpanId, bfr);
+  ctx.trace_id().ToLowerBase16(traceId);
+  apr_table_set(envTable, kEnvVarTraceId, bfr);
+  apr_table_set(envTable, kEnvVarTraceState, ctx.trace_state()->ToHeader().c_str());
+}
+
 // Starting span as early as possible (quick handler):
 // http://www.fmc-modeling.org/category/projects/apache/amp/3_3Extending_Apache.html#fig:_Apache:_request-processing_+_Module_callbacks_PN
 static int opentel_handler(request_rec *r, int /* lookup_uri */ )
@@ -148,9 +173,7 @@ static int opentel_handler(request_rec *r, int /* lookup_uri */ )
   req_data->span  = span;
   req_data->StartSpan(GetAttrsFromRequest(req));
 
-  // expose traceparent and tracestate to environment variables
-  HttpdCarrier env(*req->subprocess_env);
-  PropagatorTraceContext.Inject(env, opentelemetry::context::RuntimeContext::GetCurrent());
+  addEnvVars(req->subprocess_env, span->GetContext());
 
   return DECLINED;
 }

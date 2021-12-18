@@ -65,7 +65,6 @@ run_test() {
     curl --fail -v -H "${HEADER_1}" -H "${HEADER_2}" ${ENDPOINT_URL}/bar || failHttpd "Unable to download page with proxy enabled"
 }
 
-
 check_results() {
    echo "Checking that exactly two spans were created (client one and server one)"
    count '{' 2 # total two spans = one incoming and one outgoing

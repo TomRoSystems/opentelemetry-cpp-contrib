@@ -32,7 +32,12 @@ RUN echo "Include conf/extra/opentelemetry.conf" >> /usr/local/apache2/conf/http
 
 ### Logging traces
 
-Once module is enabled you have access to currently processed span via environment variables. Those can be accessed under `%{tracestate}e` and `%{traceparent}e` when using [LogFormat directive](https://httpd.apache.org/docs/2.4/mod/mod_log_config.html#formats).
+Once module is enabled you have access to currently processed span via environment variables. Those can be accessed under:
+- `%{OTEL_SPANID}e` for SpanID
+- `%{OTEL_TRACEID}e` for TraceID
+- `%{OTEL_TRACEFLAGS}e` for TraceID
+- `%{OTEL_TRACESTATE}e` for TraceState
+when using [LogFormat directive](https://httpd.apache.org/docs/2.4/mod/mod_log_config.html#formats).
 
 ### Installation
 
