@@ -41,6 +41,7 @@ const char kEnvVarSpanId[] = "OTEL_SPANID";
 const char kEnvVarTraceId[] = "OTEL_TRACEID";
 const char kEnvVarTraceFlags[] = "OTEL_TRACEFLAGS";
 const char kEnvVarTraceState[] = "OTEL_TRACESTATE";
+
 class HttpdCarrier : public opentelemetry::context::propagation::TextMapCarrier
 {
 public:
@@ -107,8 +108,7 @@ static void opentel_child_created(apr_pool_t*, server_rec*)
 void addEnvVars(apr_table_t *envTable, opentelemetry::trace::SpanContext ctx)
 {
   union {
-    char bfr[40] = {0};
-    char flags[1];
+    char bfr[33] = {0};
     char spanId[16];
     char traceId[32];
   } ;
@@ -117,11 +117,12 @@ void addEnvVars(apr_table_t *envTable, opentelemetry::trace::SpanContext ctx)
   {
     apr_table_set(envTable, kEnvVarTraceFlags, "1");
   }
-
+  // to keep bfr null-terminated we start from shorter (spanId)
   ctx.span_id().ToLowerBase16(spanId);
   apr_table_set(envTable, kEnvVarSpanId, bfr);
   ctx.trace_id().ToLowerBase16(traceId);
   apr_table_set(envTable, kEnvVarTraceId, bfr);
+
   apr_table_set(envTable, kEnvVarTraceState, ctx.trace_state()->ToHeader().c_str());
 }
 
