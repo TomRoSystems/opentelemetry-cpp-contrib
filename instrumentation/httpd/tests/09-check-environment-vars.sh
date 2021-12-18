@@ -1,6 +1,6 @@
 #!/bin/bash
 
-TEST_NAME="Check that tracestate and traceparent are available as variables"
+TEST_NAME="Check that information about currently processed span is available in environment variables"
 
 . tools.sh
 
